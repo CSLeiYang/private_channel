@@ -1,7 +1,10 @@
 package main
 
-import "fmt"
+import "private_channel/server"
+
 
 func main() {
-	fmt.Println("hello -world")
+	server.StartUDPServer()
+	select {		
+	}
 }

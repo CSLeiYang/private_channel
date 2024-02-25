@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
+	log "private_channel/logger"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,7 +48,7 @@ type PrivateMessageHandler struct {
 	sync.Mutex
 }
 
-func decodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
+func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	var pkg PrivatePackage
 	if len(rawBytes) < PirvatePackageMinBytes {
 		return nil, fmt.Errorf("not valid PrivatePackage, length must be at least %d bytes", PirvatePackageMinBytes)
@@ -72,6 +72,9 @@ func decodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &pkg.DataTotalLength); err != nil {
 		return nil, err
 	}
+	if err := binary.Read(buf, binary.BigEndian, &pkg.Timestamp); err != nil {
+		return nil, err
+	}
 	if pkg.Length > uint32(len(rawBytes)) {
 		return nil, fmt.Errorf("pkg.Length %d is out of bound", pkg.Length)
 	}
@@ -86,7 +89,7 @@ func decodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	return &pkg, nil
 }
 
-func encodePrivateMessage(pkg *PrivatePackage) ([]byte, error) {
+func EncodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.BigEndian, pkg.MagicNumber); err != nil {
@@ -144,73 +147,65 @@ func NewPrivateMessageHandler(count int) *PrivateMessageHandler {
 	}
 }
 
-func (handler *PrivateMessageHandler) HandleRecvBytes(rawBytes []byte) (string, []byte, error) {
+func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (bool, string, []byte, error) {
 	if rawBytes == nil {
-		return "", nil, errors.New("rawBytes is nil")
+		return false, "", nil, errors.New("rawBytes is nil")
 	}
 
 	if len(rawBytes) == 0 {
-		return "", nil, errors.New("len(rawBytes) is 0")
+		return false, "", nil, errors.New("len(rawBytes) is 0")
 	}
 
-	magicNumber := rawBytes[0]
+	pp, err := DecodePrivatePackage(rawBytes)
+	if err != nil {
+		return false, "", nil, err
+	}
+	log.Infof("Decode private package: %v/%v/%v\n", pp.Tid, pp.BatchId, pp.BatchCount)
+	position, _ := findPostion(pp, handler.privateMessages)
+	if position == -1 {
+		return false, "", nil, fmt.Errorf("can not found postion for %v", pp)
+	}
 
-	if magicNumber == PrivatePackageMagicNumber {
-		fmt.Println("Deal private package")
-		pp, err := decodePrivatePackage(rawBytes)
-		if err != nil {
-			return "", nil, err
+	pm := &handler.privateMessages[position]
+	handler.Lock()
+	defer handler.Unlock()
+	pm.Tid = pp.Tid
+	pm.IsDeal = false
+	pm.LastTS = time.Now().Unix()
+
+	if pm.ContentPackageBatches == nil {
+		pm.ContentPackageBatches = make(map[uint32]PrivatePackage)
+	}
+
+	if pp.BatchId == 0 {
+		pm.BizInfo = string(pp.Content)
+	} else {
+		pm.ContentPackageBatches[pp.BatchId] = *pp
+	}
+	pm.RealCount++
+
+	if pm.RealCount == pp.BatchCount && !pm.IsDeal {
+		pm.IsDeal = true
+		keys := make([]int, 0, pm.RealCount)
+		for k := range pm.ContentPackageBatches {
+			keys = append(keys, int(k))
 		}
-		fmt.Printf("Decode private package: %v/%v/%v\n", pp.Tid, pp.BatchId, pp.BatchCount)
-		position, _ := findPostion(pp, handler.privateMessages)
-		if position == -1 {
-			return "", nil, fmt.Errorf("can not found postion for %v", pp)
+
+		sort.Ints(keys)
+		content := make([]byte, 0)
+		for _, k := range keys {
+			content = append(content, pm.ContentPackageBatches[uint32(k)].Content...)
 		}
+		pm.ContentPackageBatches = nil
+		pm.Content = content
+		pm.IsDeal = true
+		pm.RealCount = 0
 
-		pm := handler.privateMessages[position]
-		handler.Lock()
-		defer handler.Unlock()
-		pm.Tid = pp.Tid
-		pm.IsDeal = false
-		pm.LastTS = time.Now().Unix()
-
-		if pm.ContentPackageBatches == nil {
-			pm.ContentPackageBatches = make(map[uint32]PrivatePackage)
-		}
-
-		if pp.BatchId == 0 {
-			pm.BizInfo = string(pp.Content)
-		} else {
-			pm.ContentPackageBatches[pp.BatchId] = *pp
-		}
-		pm.RealCount++
-
-		if pm.RealCount == pp.BatchCount && !pm.IsDeal {
-			pm.IsDeal = true
-			keys := make([]int, 0, pm.RealCount)
-			for k := range pm.ContentPackageBatches {
-				keys = append(keys, int(k))
-			}
-
-			sort.Ints(keys)
-			content := make([]byte, 0)
-			for _, k := range keys {
-				content = append(content, pm.ContentPackageBatches[uint32(k)].Content...)
-			}
-			pm.ContentPackageBatches = nil
-			pm.Content = content
-			pm.IsDeal = true
-			pm.RealCount = 0
-
-			return pm.BizInfo, pm.Content, nil
-
-		}
+		return true, pm.BizInfo, pm.Content, nil
 
 	} else {
-		return "", nil, fmt.Errorf("Deal normal package: %v", string(rawBytes))
+		return false, "", nil, nil
 	}
-	return "", nil, nil
-
 }
 func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, content []byte) *PrivatePackage {
 	return &PrivatePackage{
@@ -225,34 +220,19 @@ func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, leng
 	}
 
 }
-func sendUdp(conn *net.UDPConn, dataBytes []byte, remoteAddr *net.UDPAddr) (int, error) {
-	if remoteAddr == nil {
-		return conn.Write(dataBytes)
-	} else {
-		return conn.WriteToUDP(dataBytes, remoteAddr)
-	}
 
-}
-func SendPrivateMessage(conn *net.UDPConn, pm *PrivateMessage, remoteAddr *net.UDPAddr) error {
+func (handler *PrivateMessageHandler) PrivateMessageToPrivatePackage(pm *PrivateMessage) ([]*PrivatePackage, error) {
 	if pm == nil {
-		return errors.New("pm is nil")
+		return nil, errors.New("pm is nil")
 	}
 
 	dataBytesLen := len(pm.Content)
 	batchCount := int(math.Ceil(float64(dataBytesLen) / float64(PrivatePackageOnePatchSize)))
 	tid := createTid()
+	ppSlice := make([]*PrivatePackage, 0, batchCount)
 
 	firstPP := ConstructPrivatePackage(uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), []byte(pm.BizInfo))
-
-	encodedFirstPP, err := encodePrivateMessage(firstPP)
-	if err != nil {
-		return fmt.Errorf("encode private package faild: %v/%v", firstPP, err)
-	}
-	fmt.Printf("Send firstPP: %v/%v/%v\n", firstPP.Tid, firstPP.BatchId, firstPP.BatchCount)
-	_, err = sendUdp(conn, encodedFirstPP, remoteAddr)
-	if err != nil {
-		return err
-	}
+	ppSlice = append(ppSlice, firstPP)
 
 	for i := 0; i < batchCount; i++ {
 		start := PrivatePackageOnePatchSize * i
@@ -270,20 +250,9 @@ func SendPrivateMessage(conn *net.UDPConn, pm *PrivateMessage, remoteAddr *net.U
 			uint32(dataBytesLen),
 			[]byte(pm.Content[start:end]),
 		)
-		encodedDataPP, err := encodePrivateMessage(dataPP)
-		if err != nil {
-			return fmt.Errorf("encode private package faild: %v/%v", dataPP, err)
-		}
-		fmt.Printf("Send dataPP: %v/%v/%v\n", dataPP.Tid, dataPP.BatchId, dataPP.BatchCount)
-		_, err = sendUdp(conn, encodedDataPP, remoteAddr)
-		if err != nil {
-			return err
-		}
-		if batchCount > 100 {
-			time.Sleep(time.Microsecond * 1000)
-		}
+		ppSlice = append(ppSlice, dataPP)
 
 	}
-	return nil
+	return ppSlice, nil
 
 }
