@@ -19,7 +19,7 @@ const (
 	PirvatePackageMinBytes     int   = 28
 	PrivatePackageSaveMaxTime  int   = 5
 	PrivatePackageMaxBytes     int   = 1024
-	PrivatePackageOnePatchSize int   = 128
+	PrivatePackageOnePatchSize int   = 512
 )
 
 type PrivatePackage struct {
@@ -148,6 +148,7 @@ func NewPrivateMessageHandler(count int) *PrivateMessageHandler {
 }
 
 func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (bool, string, []byte, error) {
+
 	if rawBytes == nil {
 		return false, "", nil, errors.New("rawBytes is nil")
 	}
@@ -165,10 +166,13 @@ func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (boo
 	if position == -1 {
 		return false, "", nil, fmt.Errorf("can not found postion for %v", pp)
 	}
+	log.Infof("Find Postion: %v\n", position)
 
-	pm := &handler.privateMessages[position]
 	handler.Lock()
 	defer handler.Unlock()
+
+	pm := &handler.privateMessages[position]
+
 	pm.Tid = pp.Tid
 	pm.IsDeal = false
 	pm.LastTS = time.Now().Unix()
@@ -179,10 +183,13 @@ func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (boo
 
 	if pp.BatchId == 0 {
 		pm.BizInfo = string(pp.Content)
+		pm.RealCount = 0
 	} else {
 		pm.ContentPackageBatches[pp.BatchId] = *pp
 	}
 	pm.RealCount++
+
+	log.Infof("pm.RealCount/pp.BatchCount/pm.IsDeal: %v/%v/%v\n", pm.RealCount, pp.BatchCount, pm.IsDeal)
 
 	if pm.RealCount == pp.BatchCount && !pm.IsDeal {
 		pm.IsDeal = true
