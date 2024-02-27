@@ -247,7 +247,7 @@ func (pUdpConn *PUdpConn) HandleRecvPM(bizFn BizFun) {
 								log.Info("Deal reliable")
 								pm.IsReliable++ // flag have deal
 								pm.LastTS = time.Now()
-								if pm.RealCount > uint32(float32(pm.ExpectCount)*0.7) {
+								if (pm.ExpectCount > 10 && pm.RealCount > uint32(float32(pm.ExpectCount)*0.7)) || (pm.ExpectCount <= 10) {
 									batchLossIdsStr := findLossBatchIds(pm, 1, int(pm.ExpectCount-1))
 									log.Info("batchLossIdStr: ", batchLossIdsStr)
 									err := requestLossPackage(pUdpConn, pm, batchLossIdsStr)
