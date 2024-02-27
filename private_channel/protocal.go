@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	log "private_channel/logger"
 	"sort"
 	"strconv"
@@ -15,11 +16,13 @@ import (
 )
 
 const (
-	PrivatePackageMagicNumber  uint8 = 0x88
-	PirvatePackageMinBytes     int   = 28
-	PrivatePackageSaveMaxMS    int   = 800
-	PrivatePackageMaxBytes     int   = 1024
-	PrivatePackageOnePatchSize int   = 256
+	PrivatePackageMagicNumber  uint8         = 0x88
+	PirvatePackageMinBytes     int           = 28
+	PrivatePackageSaveTimeout  time.Duration = 800 * time.Millisecond
+	PrivatePackageMaxBytes     int           = 1024
+	PrivatePackageOnePatchSize int           = 256
+	PrivatePackageLossBatchId                = ^uint32(0)
+	PrivateMessageLossRetryMax uint8         = 5
 )
 
 type PrivatePackage struct {
@@ -30,25 +33,31 @@ type PrivatePackage struct {
 	Length          uint32
 	DataTotalLength uint32
 	Timestamp       int64
+	IsReliable      uint8
 	Content         []byte
 }
 
 type PrivateMessage struct {
 	Tid                   uint64
 	BizInfo               string
-	LastTS                int64
+	LastTS                time.Time
 	ExpectCount           uint32
 	RealCount             uint32
 	ContentPackageBatches map[uint32]*PrivatePackage
 	Content               []byte
+	Mu                    sync.RWMutex
+	IsReliable            uint8
 }
 
-type PrivateMessageHandler struct {
-	privateMessages []*PrivateMessage
-	lock            sync.RWMutex
-	mapTidToPostion map[int64]int
-	Done            chan struct{}
+type PUdpConn struct {
+	recvSyncPmMap sync.Map
+	sendSyncPmMap sync.Map
+	conn          *net.UDPConn
+	remoteAddr    *net.UDPAddr
+	Done          chan struct{}
 }
+
+type BizFun func(bool, string, []byte, *PUdpConn) error
 
 func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	var pkg PrivatePackage
@@ -75,6 +84,9 @@ func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 		return nil, err
 	}
 	if err := binary.Read(buf, binary.BigEndian, &pkg.Timestamp); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(buf, binary.BigEndian, &pkg.IsReliable); err != nil {
 		return nil, err
 	}
 	if pkg.Length > uint32(len(rawBytes)) {
@@ -115,6 +127,9 @@ func EncodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
 	if err := binary.Write(buf, binary.BigEndian, pkg.Timestamp); err != nil {
 		return nil, err
 	}
+	if err := binary.Write(buf, binary.BigEndian, pkg.IsReliable); err != nil {
+		return nil, err
+	}
 	if err := binary.Write(buf, binary.BigEndian, pkg.Content); err != nil {
 		return nil, err
 	}
@@ -131,128 +146,221 @@ func createTid() int64 {
 
 }
 
-func findPostion(pp *PrivatePackage, pmHandler *PrivateMessageHandler) (int, bool) {
-	currentUnixTime := time.Now().UnixMilli()
-	pmHandler.lock.RLock()
-	defer pmHandler.lock.RUnlock()
-
-	for i, pm := range pmHandler.privateMessages {
-		if pm != nil && pp.Tid == pm.Tid {
-			return i, true
-		}
+func NewPudpConn(conn *net.UDPConn, addr *net.UDPAddr, bizFn BizFun) *PUdpConn {
+	ph := &PUdpConn{
+		conn:       conn,
+		remoteAddr: addr,
 	}
-	for i, pm := range pmHandler.privateMessages {
-		if pm == nil {
-			pmHandler.privateMessages[i] = &PrivateMessage{}
-			return i, true
-		}
-	}
-	for i, pm := range pmHandler.privateMessages {
-		if pm.Tid == 0 {
-			return i, true
-		}
-	}
-	for i, pm := range pmHandler.privateMessages {
-		if pm.LastTS-currentUnixTime > int64(PrivatePackageSaveMaxMS) {
-			return i, true
-		}
-	}
-	return -1, false
-}
-
-func NewPrivateMessageHandler(count int) *PrivateMessageHandler {
-	ph := &PrivateMessageHandler{
-		privateMessages: make([]*PrivateMessage, count),
-		mapTidToPostion: make(map[int64]int, count),
-	}
-	go ph.CronTaskStart()
+	go ph.HandleRecvPM(bizFn)
+	go ph.HandleSendPM()
 	return ph
 }
 
-func (hander *PrivateMessageHandler) CronTaskStart() {
+func findLossBatchIds(pm *PrivateMessage, start, end int) string {
+	var lossing string
+	for i := start; i <= end; i++ {
+		if _, exists := pm.ContentPackageBatches[uint32(i)]; !exists {
+			lossing += fmt.Sprintf("%d|", i)
+		}
+	}
+	return lossing
+}
+
+func requestLossPackage(pUdpConn *PUdpConn, pm *PrivateMessage, batchLossIdsStr string) error {
+	batchLossBytes := []byte(batchLossIdsStr)
+	lossPP := ConstructPrivatePackage(
+		pm.Tid,
+		PrivatePackageLossBatchId,
+		1,
+		uint32(len(batchLossBytes)),
+		uint32(len(batchLossBytes)),
+		0,
+		batchLossBytes,
+	)
+	return SendPrivatePackage(pUdpConn, lossPP)
+}
+
+func handleLossPackage(pUdpConn *PUdpConn, pmId uint64, lossBatchIdsStr string) error {
+	actual, ok := pUdpConn.sendSyncPmMap.Load(pmId)
+	if !ok {
+		return fmt.Errorf("not found pm:%v in sendSyncPmMap", pmId)
+	}
+	pm, ok := actual.(*PrivateMessage)
+	if !ok {
+		return fmt.Errorf("%v Store value is not of type *PrivateMessage", pmId)
+	}
+
+	log.Info("lossBatchIdsStr:", lossBatchIdsStr)
+	lossBatchIdsSlice := strings.Split(lossBatchIdsStr, "|")
+	log.Info("lossBatchIdsSlice: ", lossBatchIdsSlice)
+	for _, batchIdStr := range lossBatchIdsSlice {
+		if len(batchIdStr) == 0 {
+			continue
+		}
+		batchId, err := strconv.ParseUint(batchIdStr, 10, 32)
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+		onePP, ok := pm.ContentPackageBatches[uint32(batchId)]
+		if ok {
+			err := SendPrivatePackage(pUdpConn, onePP)
+			if err != nil {
+				log.Error(err)
+				continue
+			}
+
+		} else {
+			log.Warnf("Not found pm:%v,batchId:%v", pm.Tid, batchId)
+		}
+	}
+	return nil
+}
+func (pUdpConn *PUdpConn) HandleRecvPM(bizFn BizFun) {
 	for {
 		select {
-		case <-hander.Done:
-			log.Info("cronTask quit!")
+		case <-pUdpConn.Done:
+			log.Info("HandleRecvPM quit!")
 			return
-		case <-time.After(time.Millisecond * 200):
-			currentTime := time.Now().UnixMilli()
-			for _, pm := range hander.privateMessages {
-				if pm != nil && pm.Tid > 0 && pm.LastTS != 0 && (currentTime-pm.LastTS) > int64(PrivatePackageSaveMaxMS) {
-					log.Infof("Deal pm.Tid: %v, e: %v\n", pm.Tid, (currentTime - pm.LastTS))
-					wholePM, bizInfo, pmContent := resamplePPToPM(pm)
-					HandlePEvent(wholePM, bizInfo, pmContent)
+		case <-time.After(time.Millisecond * 100):
+			pUdpConn.recvSyncPmMap.Range(func(key, value interface{}) bool {
+				pm, ok := value.(*PrivateMessage)
+				if ok {
+					if pm.RealCount == pm.ExpectCount {
+						pm.Mu.Lock()
+						wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+						pm.Mu.Unlock()
+						bizFn(wholePM, bizInfo, pmContent, pUdpConn)
+						pUdpConn.recvSyncPmMap.Delete(key)
+
+					} else {
+						if time.Since(pm.LastTS) > PrivatePackageSaveTimeout {
+							if pm.IsReliable == 0 || pm.IsReliable > PrivateMessageLossRetryMax {
+								log.Info("Deal not reliable")
+								pm.Mu.Lock()
+								wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+								pm.Mu.Unlock()
+								bizFn(wholePM, bizInfo, pmContent, pUdpConn)
+								pUdpConn.recvSyncPmMap.Delete(key)
+
+							} else {
+								log.Info("Deal reliable")
+								pm.IsReliable++ // flag have deal
+								pm.LastTS = time.Now()
+								if pm.RealCount > uint32(float32(pm.ExpectCount)*0.7) {
+									batchLossIdsStr := findLossBatchIds(pm, 1, int(pm.ExpectCount-1))
+									log.Info("batchLossIdStr: ", batchLossIdsStr)
+									err := requestLossPackage(pUdpConn, pm, batchLossIdsStr)
+									if err != nil {
+										log.Error(err)
+									}
+
+								}
+
+							}
+						}
+					}
+
+				} else {
+					log.Warnf("pm:%v is not of type *PrivateMessage", key)
 				}
-			}
+				return true
+
+			})
+
 		}
 	}
 }
 
-func (hander *PrivateMessageHandler) CronTaskStop() {
-	close(hander.Done)
+func (pUdpConn *PUdpConn) HandleSendPM() {
+	for {
+		select {
+		case <-pUdpConn.Done:
+			log.Info("HandleSendPM quit!")
+			return
+		case <-time.After(time.Millisecond * 500):
+			pUdpConn.sendSyncPmMap.Range(func(key, value interface{}) bool {
+				pm, ok := value.(*PrivateMessage)
+				if ok {
+					if time.Since(pm.LastTS) > 5*PrivatePackageSaveTimeout {
+						log.Infof("delete pm:%v from SendPM\n", key)
+						pUdpConn.sendSyncPmMap.Delete(key)
+					}
+
+				} else {
+					log.Warnf("pm:%v is not of type *PrivateMessage", key)
+				}
+				return true
+			})
+
+		}
+	}
 }
 
-func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (bool, string, []byte, error) {
+func (pUdpConn *PUdpConn) UdpConnStop() {
+	close(pUdpConn.Done)
+}
+
+func (pUdpConn *PUdpConn) RecvPrivatePackage(rawBytes []byte) error {
 	start := time.Now()
 
 	if rawBytes == nil {
-		return false, "", nil, errors.New("rawBytes is nil")
+		return errors.New("rawBytes is nil")
 	}
 
 	if len(rawBytes) == 0 {
-		return false, "", nil, errors.New("len(rawBytes) is 0")
+		return errors.New("len(rawBytes) is 0")
 	}
 
 	pp, err := DecodePrivatePackage(rawBytes)
 	if err != nil {
-		return false, "", nil, err
-	}
-	pmPostion := -1
-
-	if postion, exits := handler.mapTidToPostion[int64(pp.Tid)]; exits {
-		pmPostion = postion
-	} else {
-
-		pmPostion, _ = findPostion(pp, handler)
-		handler.mapTidToPostion[int64(pp.Tid)] = pmPostion
+		return err
 	}
 
-	if pmPostion == -1 {
-		return false, "", nil, fmt.Errorf("can not found postion for %v", pp)
+	actual, _ := pUdpConn.recvSyncPmMap.LoadOrStore(pp.Tid, &PrivateMessage{
+		Tid:                   pp.Tid,
+		LastTS:                time.Now(),
+		ExpectCount:           pp.BatchCount,
+		ContentPackageBatches: make(map[uint32]*PrivatePackage),
+		IsReliable:            pp.IsReliable,
+	})
+	pm, ok := actual.(*PrivateMessage)
+	if !ok {
+		return fmt.Errorf("%v Store value is not of type *PrivateMessage", pp.Tid)
 	}
 
-	handler.lock.Lock()
-	defer handler.lock.Unlock()
-	pm := handler.privateMessages[pmPostion]
-
-	pm.Tid = pp.Tid
-	pm.LastTS = time.Now().UnixMilli()
-
-	if pm.ContentPackageBatches == nil {
-		pm.ContentPackageBatches = make(map[uint32]*PrivatePackage)
-	}
-
-	if pp.BatchId == 0 {
-		pm.BizInfo = string(pp.Content)
+	if pp.BatchId == PrivatePackageLossBatchId {
+		//del loss batchid
+		log.Info("deal loss pp:", string(pp.Content))
+		err := handleLossPackage(pUdpConn, pp.Tid, string(pp.Content))
+		if err != nil {
+			return err
+		}
 
 	} else {
-		pm.ContentPackageBatches[pp.BatchId] = pp
-		pm.ExpectCount = pp.BatchCount
-	}
-	pm.RealCount++
-	log.Infof("pp/pm/d: (%v:%v:%v)/(%v,%v,%v)/%v\n",
-		pp.Tid, pp.BatchId, pp.BatchCount,
-		pm.Tid, pm.RealCount, pp.BatchCount,
-		time.Since(start).Milliseconds())
+		pm.Mu.Lock()
+		defer pm.Mu.Unlock()
 
-	if uint32(pm.Tid) == uint32(pp.Tid) && pm.RealCount == pp.BatchCount {
-		wholePM, bizInfo, pmContent := resamplePPToPM(pm)
-		return wholePM, bizInfo, pmContent, nil
+		pm.LastTS = time.Now()
 
-	} else {
-		return false, "", nil, nil
+		if pp.BatchId == 0 {
+			pm.BizInfo = string(pp.Content)
+		} else {
+			pm.ContentPackageBatches[pp.BatchId] = pp
+		}
+		pm.RealCount++
+
+		log.Infof("pp/pm/d: (%v:%v:%v)/(%v,%v,%v)/%v\n",
+			pp.Tid, pp.BatchId, pp.BatchCount,
+			pm.Tid, pm.RealCount, pp.BatchCount,
+			time.Since(start).Milliseconds())
+
 	}
+
+	return nil
+
 }
+
 func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 	keys := make([]int, 0, pm.RealCount)
 	for k := range pm.ContentPackageBatches {
@@ -261,6 +369,7 @@ func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 
 	sort.Ints(keys)
 	pmContent := make([]byte, 0)
+	bizInfo := pm.BizInfo
 	for _, k := range keys {
 		pmContent = append(pmContent, pm.ContentPackageBatches[uint32(k)].Content...)
 	}
@@ -276,10 +385,10 @@ func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 	pm.ContentPackageBatches = nil
 	pm.RealCount = 0
 
-	return wholePM, pm.BizInfo, pmContent
+	return wholePM, bizInfo, pmContent
 
 }
-func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, content []byte) *PrivatePackage {
+func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, isReliable uint8, content []byte) *PrivatePackage {
 	return &PrivatePackage{
 		MagicNumber:     PrivatePackageMagicNumber,
 		Tid:             tid,
@@ -288,23 +397,63 @@ func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, leng
 		Length:          length,
 		DataTotalLength: dataTotalLength,
 		Timestamp:       time.Now().Unix(),
+		IsReliable:      isReliable,
 		Content:         content,
 	}
 
 }
 
-func (handler *PrivateMessageHandler) PrivateMessageToPrivatePackage(pm *PrivateMessage) ([]*PrivatePackage, error) {
+func SendPrivatePackage(pUdpConn *PUdpConn, pp *PrivatePackage) error {
+	log.Infof("pp.Tid/pp.BatchId:%v/%v", pp.Tid, pp.BatchId)
+	encodePP, err := EncodePrivatePackage(pp)
+	if err != nil {
+		return nil
+	}
+	encryptEncodePP, err := EncryptAES(encodePP)
+	if err != nil {
+		return nil
+	}
+	if pUdpConn.remoteAddr == nil {
+		_, err := pUdpConn.conn.Write(encryptEncodePP)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		_, err := pUdpConn.conn.WriteToUDP(encryptEncodePP, pUdpConn.remoteAddr)
+		if err != nil {
+			return nil
+		}
+
+	}
+	return nil
+
+}
+
+func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 	if pm == nil {
-		return nil, errors.New("pm is nil")
+		return errors.New("pm is nil")
 	}
 
 	dataBytesLen := len(pm.Content)
 	batchCount := int(math.Ceil(float64(dataBytesLen) / float64(PrivatePackageOnePatchSize)))
 	tid := createTid()
-	ppSlice := make([]*PrivatePackage, 0, batchCount)
 
-	firstPP := ConstructPrivatePackage(uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), []byte(pm.BizInfo))
-	ppSlice = append(ppSlice, firstPP)
+	firstPP := ConstructPrivatePackage(uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), pm.IsReliable, []byte(pm.BizInfo))
+
+	//construct sendPM
+	sendPm := &PrivateMessage{
+		Tid:                   firstPP.Tid,
+		ContentPackageBatches: make(map[uint32]*PrivatePackage),
+		LastTS:                time.Now(),
+		IsReliable:            pm.IsReliable,
+	}
+	sendPm.ContentPackageBatches[firstPP.BatchId] = firstPP
+	//send firstPP
+	err := SendPrivatePackage(pUdpConn, firstPP)
+	if err != nil {
+		return err
+	}
 
 	for i := 0; i < batchCount; i++ {
 		start := PrivatePackageOnePatchSize * i
@@ -320,11 +469,26 @@ func (handler *PrivateMessageHandler) PrivateMessageToPrivatePackage(pm *Private
 			uint32(batchCount+1),
 			uint32(end-start),
 			uint32(dataBytesLen),
+			pm.IsReliable,
 			[]byte(pm.Content[start:end]),
 		)
-		ppSlice = append(ppSlice, dataPP)
+		sendPm.ContentPackageBatches[dataPP.BatchId] = dataPP
+		sendPm.LastTS = time.Now()
+		err := SendPrivatePackage(pUdpConn, dataPP)
+		if err != nil {
+			log.Error(err)
+		}
+		if batchCount > 10 {
+			time.Sleep(time.Millisecond * (time.Duration(PrivatePackageMaxBytes / 10)))
+		}
 
 	}
-	return ppSlice, nil
 
+	if sendPm.IsReliable > 0 {
+		log.Infof("store pm:%v to sendSyncPMMap", sendPm.Tid)
+		pUdpConn.sendSyncPmMap.Store(sendPm.Tid, sendPm)
+
+	}
+
+	return nil
 }

@@ -8,7 +8,6 @@ import (
 	log "private_channel/logger"
 	private_channel "private_channel/private_channel"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -35,7 +34,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	handler := private_channel.NewPrivateMessageHandler(5)
+	onePupConn := private_channel.NewPudpConn(conn, nil, private_channel.HandlePEvent)
 	go func() {
 		for {
 			buffer := make([]byte, 4096)
@@ -47,12 +46,11 @@ func main() {
 			dencryptedBytes, _ := private_channel.DescryptAES(buffer[:n])
 
 			if dencryptedBytes[0] == private_channel.PrivatePackageMagicNumber {
-				havePM, bizInfo, content, err := handler.HandlePrivatePackage(dencryptedBytes)
+				err := onePupConn.RecvPrivatePackage(dencryptedBytes)
 				if err != nil {
 					log.Error(err)
 					continue
 				}
-				private_channel.HandlePEvent(havePM, bizInfo, content)
 
 			} else {
 				dencryptedBytesStr := string(dencryptedBytes)
@@ -72,7 +70,7 @@ func main() {
 
 		if strings.EqualFold(input, "exit") {
 			log.Info("exit client")
-			handler.CronTaskStop()
+			onePupConn.UdpConnStop()
 			return
 		}
 
@@ -101,22 +99,10 @@ func main() {
 				continue
 			}
 
-			ppSlice, err := handler.PrivateMessageToPrivatePackage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(data)})
+			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(data)})
 			if err != nil {
 				log.Warn(err)
 				continue
-			}
-
-			for _, p := range ppSlice {
-				encodedPP, _ := private_channel.EncodePrivatePackage(p)
-				encryptedPPBytes, _ := private_channel.EncryptAES(encodedPP)
-				_, err := conn.Write(encryptedPPBytes)
-				if err != nil {
-					log.Warn(err)
-				}
-				if len(ppSlice) > 10 {
-					time.Sleep(time.Microsecond * 100)
-				}
 			}
 		case "TTS":
 			log.Info("Input TTS: ")
@@ -135,24 +121,10 @@ func main() {
 				continue
 			}
 
-			ppSlice, err := handler.PrivateMessageToPrivatePackage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(chatContent)})
+			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(chatContent)})
 			if err != nil {
 				log.Warn(err)
 				continue
-			}
-
-			for _, p := range ppSlice {
-				encodedPP, _ := private_channel.EncodePrivatePackage(p)
-				log.Info("send pp: ", encodedPP)
-				encryptedPPBytes, _ := private_channel.EncryptAES(encodedPP)
-				_, err := conn.Write(encryptedPPBytes)
-				if err != nil {
-					log.Warn(err)
-				}
-				if len(ppSlice) > 10 {
-					time.Sleep(time.Microsecond * 100)
-				}
-
 			}
 
 		default:
@@ -170,20 +142,10 @@ func main() {
 				continue
 			}
 
-			ppSlice, err := handler.PrivateMessageToPrivatePackage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(chatContent)})
+			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(chatContent)})
 			if err != nil {
 				log.Warn(err)
 				continue
-			}
-
-			for _, p := range ppSlice {
-				encodedPP, _ := private_channel.EncodePrivatePackage(p)
-				encryptedPPBytes, _ := private_channel.EncryptAES(encodedPP)
-				_, err := conn.Write(encryptedPPBytes)
-				if err != nil {
-					log.Warn(err)
-				}
-				time.Sleep(time.Microsecond * 100)
 			}
 		}
 

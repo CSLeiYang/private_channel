@@ -27,7 +27,7 @@ type PEvent struct {
 	EventContent string `json:"event_content"`
 }
 
-func HandlePCommand(bizInfo string, content []byte) (*PrivateMessage, error) {
+func HandlePCommand(wholePM, bizInfo string, content []byte, pUdpConn *PUdpConn) error {
 	var (
 		pCmd   PCommand
 		pm     *PrivateMessage
@@ -36,7 +36,7 @@ func HandlePCommand(bizInfo string, content []byte) (*PrivateMessage, error) {
 
 	err := json.Unmarshal([]byte(bizInfo), &pCmd)
 	if err != nil {
-		return pm, err
+		return err
 	}
 	log.Info("PCommand: ", pCmd)
 	switch pCmd.Cmd {
@@ -50,7 +50,7 @@ func HandlePCommand(bizInfo string, content []byte) (*PrivateMessage, error) {
 		fileName := pCmd.Params
 		err := os.WriteFile(fileName, content, 0666)
 		if err != nil {
-			return pm, err
+			return err
 		}
 		pEvent = PEvent{
 			SID:          pCmd.SID,
@@ -67,17 +67,18 @@ func HandlePCommand(bizInfo string, content []byte) (*PrivateMessage, error) {
 
 	pEventStr, err := json.Marshal(&pEvent)
 	if err != nil {
-		return pm, err
+		return err
 	}
 
 	pm = &PrivateMessage{
 		BizInfo: string(pEventStr),
 	}
-	return pm, nil
+	pUdpConn.SendPrivateMessage(pm)
+	return nil
 
 }
 
-func HandlePEvent(wholePM bool, bizInfo string, content []byte) error {
+func HandlePEvent(wholePM bool, bizInfo string, content []byte, pUdpCon *PUdpConn) error {
 	if len(bizInfo) == 0 {
 		return errors.New("bizInfo is empty")
 	}

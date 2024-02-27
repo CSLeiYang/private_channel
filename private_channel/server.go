@@ -22,10 +22,10 @@ const (
 )
 
 type udpClient struct {
-	conn          *net.UDPConn
 	addr          *net.UDPAddr
+	conn          *net.UDPConn
 	lastHeartBeat time.Time
-	handler       *PrivateMessageHandler
+	pudpConn      *PUdpConn
 }
 
 var (
@@ -66,7 +66,7 @@ func StartUDPServer() {
 	go sendUDPHeartbeats(conn)
 
 	for {
-		buffer := make([]byte,1024)
+		buffer := make([]byte, 1024)
 		n, clientAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Warnf("Error reading UDP data: %s", err)
@@ -90,44 +90,10 @@ func StartUDPServer() {
 		go func(recvData []byte, oneUdpClient *udpClient) {
 			if recvData[0] == PrivatePackageMagicNumber {
 				log.Info("recvData: ", recvData)
-				havePM, bizInfo, content, err := oneUdpClient.handler.HandlePrivatePackage(recvData)
+				err := oneUdpClient.pudpConn.RecvPrivatePackage(recvData)
 				if err != nil {
 					log.Warn(err)
 					return
-				} else {
-					if havePM {
-						pm, err := HandlePCommand(bizInfo, content)
-						if err != nil {
-							log.Warn(err)
-							return
-						}
-						ppSlice, err := oneUdpClient.handler.PrivateMessageToPrivatePackage(pm)
-						if err != nil {
-							log.Warn(err)
-							return
-						}
-						log.Infof("ppSlice: %v", ppSlice)
-
-						for _, pp := range ppSlice {
-							encodedPP, err := EncodePrivatePackage(pp)
-							if err != nil {
-								log.Warn(err)
-								return
-							}
-							log.Info("encodedPP: ", encodedPP)
-							encryptedPPBytes, _ := EncryptAES(encodedPP)
-							_, err = oneUdpClient.conn.WriteToUDP(encryptedPPBytes, oneUdpClient.addr)
-							if err != nil {
-								log.Warn(err)
-								return
-							}
-							time.Sleep(time.Microsecond * 100)
-						}
-						log.Info("Send end")
-
-					} else {
-						log.Info("need more pacakge ")
-					}
 				}
 
 			} else {
@@ -169,7 +135,7 @@ func updateUDPClient(udpCon *net.UDPConn, clientAddr *net.UDPAddr) *udpClient {
 	if client, exits := udpClients[clientKey]; exits {
 		client.lastHeartBeat = time.Now()
 	} else {
-		udpClients[clientKey] = &udpClient{conn: udpCon, addr: clientAddr, lastHeartBeat: time.Now(), handler: NewPrivateMessageHandler(5)}
+		udpClients[clientKey] = &udpClient{conn: udpCon, addr: clientAddr, lastHeartBeat: time.Now(), pudpConn: NewPudpConn(udpCon, clientAddr, HandlePEvent)}
 		log.Infof("New UDP client: %s\n", clientKey)
 	}
 	return udpClients[clientKey]
