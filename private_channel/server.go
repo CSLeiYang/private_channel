@@ -1,4 +1,4 @@
-package server
+package private_channel
 
 import (
 	"bytes"
@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	log "private_channel/logger"
-	p_protocal "private_channel/protocal"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +25,7 @@ type udpClient struct {
 	conn          *net.UDPConn
 	addr          *net.UDPAddr
 	lastHeartBeat time.Time
-	handler       *p_protocal.PrivateMessageHandler
+	handler       *PrivateMessageHandler
 }
 
 var (
@@ -89,7 +88,7 @@ func StartUDPServer() {
 		oneUdpClient := updateUDPClient(conn, clientAddr)
 
 		go func(recvData []byte, oneUdpClient *udpClient) {
-			if recvData[0] == p_protocal.PrivatePackageMagicNumber {
+			if recvData[0] == PrivatePackageMagicNumber {
 				log.Info("recvData: ", recvData)
 				havePM, bizInfo, content, err := oneUdpClient.handler.HandlePrivatePackage(recvData)
 				if err != nil {
@@ -97,7 +96,7 @@ func StartUDPServer() {
 					return
 				} else {
 					if havePM {
-						pm, err := p_protocal.HandlePCommand(bizInfo, content)
+						pm, err := HandlePCommand(bizInfo, content)
 						if err != nil {
 							log.Warn(err)
 							return
@@ -110,7 +109,7 @@ func StartUDPServer() {
 						log.Infof("ppSlice: %v", ppSlice)
 
 						for _, pp := range ppSlice {
-							encodedPP, err := p_protocal.EncodePrivatePackage(pp)
+							encodedPP, err := EncodePrivatePackage(pp)
 							if err != nil {
 								log.Warn(err)
 								return
@@ -170,7 +169,7 @@ func updateUDPClient(udpCon *net.UDPConn, clientAddr *net.UDPAddr) *udpClient {
 	if client, exits := udpClients[clientKey]; exits {
 		client.lastHeartBeat = time.Now()
 	} else {
-		udpClients[clientKey] = &udpClient{conn: udpCon, addr: clientAddr, lastHeartBeat: time.Now(), handler: p_protocal.NewPrivateMessageHandler(5)}
+		udpClients[clientKey] = &udpClient{conn: udpCon, addr: clientAddr, lastHeartBeat: time.Now(), handler: NewPrivateMessageHandler(5)}
 		log.Infof("New UDP client: %s\n", clientKey)
 	}
 	return udpClients[clientKey]

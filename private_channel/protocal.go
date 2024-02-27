@@ -1,4 +1,4 @@
-package protocal
+package private_channel
 
 import (
 	"bytes"
@@ -17,9 +17,9 @@ import (
 const (
 	PrivatePackageMagicNumber  uint8 = 0x88
 	PirvatePackageMinBytes     int   = 28
-	PrivatePackageSaveMaxTime  int   = 5
+	PrivatePackageSaveMaxMS    int   = 800
 	PrivatePackageMaxBytes     int   = 1024
-	PrivatePackageOnePatchSize int   = 512
+	PrivatePackageOnePatchSize int   = 256
 )
 
 type PrivatePackage struct {
@@ -37,15 +37,17 @@ type PrivateMessage struct {
 	Tid                   uint64
 	BizInfo               string
 	LastTS                int64
-	IsDeal                bool
+	ExpectCount           uint32
 	RealCount             uint32
-	ContentPackageBatches map[uint32]PrivatePackage
+	ContentPackageBatches map[uint32]*PrivatePackage
 	Content               []byte
 }
 
 type PrivateMessageHandler struct {
-	privateMessages []PrivateMessage
-	sync.Mutex
+	privateMessages []*PrivateMessage
+	lock            sync.RWMutex
+	mapTidToPostion map[int64]int
+	Done            chan struct{}
 }
 
 func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
@@ -129,25 +131,69 @@ func createTid() int64 {
 
 }
 
-func findPostion(pp *PrivatePackage, pms []PrivateMessage) (int, bool) {
-	currentUnixTime := time.Now().Unix()
-	for i, pm := range pms {
-		emptyOrExpired := pm.Tid == 0 || pm.IsDeal || (pm.LastTS > 0 && currentUnixTime-pm.LastTS > int64(PrivatePackageSaveMaxTime))
-		if (pm.Tid == pp.Tid && !pm.IsDeal) || emptyOrExpired {
-			return i, emptyOrExpired
+func findPostion(pp *PrivatePackage, pmHandler *PrivateMessageHandler) (int, bool) {
+	currentUnixTime := time.Now().UnixMilli()
+	pmHandler.lock.RLock()
+	defer pmHandler.lock.RUnlock()
+
+	for i, pm := range pmHandler.privateMessages {
+		if pm != nil && pp.Tid == pm.Tid {
+			return i, true
 		}
 	}
-
+	for i, pm := range pmHandler.privateMessages {
+		if pm == nil {
+			pmHandler.privateMessages[i] = &PrivateMessage{}
+			return i, true
+		}
+	}
+	for i, pm := range pmHandler.privateMessages {
+		if pm.Tid == 0 {
+			return i, true
+		}
+	}
+	for i, pm := range pmHandler.privateMessages {
+		if pm.LastTS-currentUnixTime > int64(PrivatePackageSaveMaxMS) {
+			return i, true
+		}
+	}
 	return -1, false
 }
 
 func NewPrivateMessageHandler(count int) *PrivateMessageHandler {
-	return &PrivateMessageHandler{
-		privateMessages: make([]PrivateMessage, count),
+	ph := &PrivateMessageHandler{
+		privateMessages: make([]*PrivateMessage, count),
+		mapTidToPostion: make(map[int64]int, count),
+	}
+	go ph.CronTaskStart()
+	return ph
+}
+
+func (hander *PrivateMessageHandler) CronTaskStart() {
+	for {
+		select {
+		case <-hander.Done:
+			log.Info("cronTask quit!")
+			return
+		case <-time.After(time.Millisecond * 200):
+			currentTime := time.Now().UnixMilli()
+			for _, pm := range hander.privateMessages {
+				if pm != nil && pm.Tid > 0 && pm.LastTS != 0 && (currentTime-pm.LastTS) > int64(PrivatePackageSaveMaxMS) {
+					log.Infof("Deal pm.Tid: %v, e: %v\n", pm.Tid, (currentTime - pm.LastTS))
+					wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+					HandlePEvent(wholePM, bizInfo, pmContent)
+				}
+			}
+		}
 	}
 }
 
+func (hander *PrivateMessageHandler) CronTaskStop() {
+	close(hander.Done)
+}
+
 func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (bool, string, []byte, error) {
+	start := time.Now()
 
 	if rawBytes == nil {
 		return false, "", nil, errors.New("rawBytes is nil")
@@ -161,58 +207,77 @@ func (handler *PrivateMessageHandler) HandlePrivatePackage(rawBytes []byte) (boo
 	if err != nil {
 		return false, "", nil, err
 	}
-	log.Infof("Decode private package: %v/%v/%v\n", pp.Tid, pp.BatchId, pp.BatchCount)
-	position, _ := findPostion(pp, handler.privateMessages)
-	if position == -1 {
+	pmPostion := -1
+
+	if postion, exits := handler.mapTidToPostion[int64(pp.Tid)]; exits {
+		pmPostion = postion
+	} else {
+
+		pmPostion, _ = findPostion(pp, handler)
+		handler.mapTidToPostion[int64(pp.Tid)] = pmPostion
+	}
+
+	if pmPostion == -1 {
 		return false, "", nil, fmt.Errorf("can not found postion for %v", pp)
 	}
-	log.Infof("Find Postion: %v\n", position)
 
-	handler.Lock()
-	defer handler.Unlock()
-
-	pm := &handler.privateMessages[position]
+	handler.lock.Lock()
+	defer handler.lock.Unlock()
+	pm := handler.privateMessages[pmPostion]
 
 	pm.Tid = pp.Tid
-	pm.IsDeal = false
-	pm.LastTS = time.Now().Unix()
+	pm.LastTS = time.Now().UnixMilli()
 
 	if pm.ContentPackageBatches == nil {
-		pm.ContentPackageBatches = make(map[uint32]PrivatePackage)
+		pm.ContentPackageBatches = make(map[uint32]*PrivatePackage)
 	}
 
 	if pp.BatchId == 0 {
 		pm.BizInfo = string(pp.Content)
-		pm.RealCount = 0
+
 	} else {
-		pm.ContentPackageBatches[pp.BatchId] = *pp
+		pm.ContentPackageBatches[pp.BatchId] = pp
+		pm.ExpectCount = pp.BatchCount
 	}
 	pm.RealCount++
+	log.Infof("pp/pm/d: (%v:%v:%v)/(%v,%v,%v)/%v\n",
+		pp.Tid, pp.BatchId, pp.BatchCount,
+		pm.Tid, pm.RealCount, pp.BatchCount,
+		time.Since(start).Milliseconds())
 
-	log.Infof("pm.RealCount/pp.BatchCount/pm.IsDeal: %v/%v/%v\n", pm.RealCount, pp.BatchCount, pm.IsDeal)
-
-	if pm.RealCount == pp.BatchCount && !pm.IsDeal {
-		pm.IsDeal = true
-		keys := make([]int, 0, pm.RealCount)
-		for k := range pm.ContentPackageBatches {
-			keys = append(keys, int(k))
-		}
-
-		sort.Ints(keys)
-		content := make([]byte, 0)
-		for _, k := range keys {
-			content = append(content, pm.ContentPackageBatches[uint32(k)].Content...)
-		}
-		pm.ContentPackageBatches = nil
-		pm.Content = content
-		pm.IsDeal = true
-		pm.RealCount = 0
-
-		return true, pm.BizInfo, pm.Content, nil
+	if uint32(pm.Tid) == uint32(pp.Tid) && pm.RealCount == pp.BatchCount {
+		wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+		return wholePM, bizInfo, pmContent, nil
 
 	} else {
 		return false, "", nil, nil
 	}
+}
+func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
+	keys := make([]int, 0, pm.RealCount)
+	for k := range pm.ContentPackageBatches {
+		keys = append(keys, int(k))
+	}
+
+	sort.Ints(keys)
+	pmContent := make([]byte, 0)
+	for _, k := range keys {
+		pmContent = append(pmContent, pm.ContentPackageBatches[uint32(k)].Content...)
+	}
+	wholePM := false
+	ppLoss := pm.ExpectCount - pm.RealCount
+	log.Infof("PM ExpectCount/RealCount %v/%v\n", pm.ExpectCount, pm.RealCount)
+	if ppLoss == 0 {
+		wholePM = true
+	}
+
+	//
+	pm.Tid = 0
+	pm.ContentPackageBatches = nil
+	pm.RealCount = 0
+
+	return wholePM, pm.BizInfo, pmContent
+
 }
 func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, content []byte) *PrivatePackage {
 	return &PrivatePackage{
