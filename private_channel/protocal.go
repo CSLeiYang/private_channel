@@ -59,7 +59,7 @@ type PUdpConn struct {
 
 type BizFun func(bool, string, []byte, *PUdpConn) error
 
-func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
+func decodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	var pkg PrivatePackage
 	if len(rawBytes) < PirvatePackageMinBytes {
 		return nil, fmt.Errorf("not valid PrivatePackage, length must be at least %d bytes", PirvatePackageMinBytes)
@@ -103,7 +103,7 @@ func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	return &pkg, nil
 }
 
-func EncodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
+func encodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.BigEndian, pkg.MagicNumber); err != nil {
@@ -168,7 +168,7 @@ func findLossBatchIds(pm *PrivateMessage, start, end int) string {
 
 func requestLossPackage(pUdpConn *PUdpConn, pm *PrivateMessage, batchLossIdsStr string) error {
 	batchLossBytes := []byte(batchLossIdsStr)
-	lossPP := ConstructPrivatePackage(
+	lossPP := constructPrivatePackage(
 		pm.Tid,
 		PrivatePackageLossBatchId,
 		1,
@@ -312,7 +312,7 @@ func (pUdpConn *PUdpConn) RecvPrivatePackage(rawBytes []byte) error {
 		return errors.New("len(rawBytes) is 0")
 	}
 
-	pp, err := DecodePrivatePackage(rawBytes)
+	pp, err := decodePrivatePackage(rawBytes)
 	if err != nil {
 		return err
 	}
@@ -388,7 +388,7 @@ func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 	return wholePM, bizInfo, pmContent
 
 }
-func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, isReliable uint8, content []byte) *PrivatePackage {
+func constructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, isReliable uint8, content []byte) *PrivatePackage {
 	return &PrivatePackage{
 		MagicNumber:     PrivatePackageMagicNumber,
 		Tid:             tid,
@@ -405,7 +405,7 @@ func ConstructPrivatePackage(tid uint64, batchId uint32, batchCount uint32, leng
 
 func SendPrivatePackage(pUdpConn *PUdpConn, pp *PrivatePackage) error {
 	log.Infof("pp.Tid/pp.BatchId:%v/%v", pp.Tid, pp.BatchId)
-	encodePP, err := EncodePrivatePackage(pp)
+	encodePP, err := encodePrivatePackage(pp)
 	if err != nil {
 		return nil
 	}
@@ -439,7 +439,7 @@ func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 	batchCount := int(math.Ceil(float64(dataBytesLen) / float64(PrivatePackageOnePatchSize)))
 	tid := createTid()
 
-	firstPP := ConstructPrivatePackage(uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), pm.IsReliable, []byte(pm.BizInfo))
+	firstPP := constructPrivatePackage(uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), pm.IsReliable, []byte(pm.BizInfo))
 
 	//construct sendPM
 	sendPm := &PrivateMessage{
@@ -463,7 +463,7 @@ func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 			end = dataBytesLen
 		}
 
-		dataPP := ConstructPrivatePackage(
+		dataPP := constructPrivatePackage(
 			uint64(tid),
 			uint32(i+1),
 			uint32(batchCount+1),
