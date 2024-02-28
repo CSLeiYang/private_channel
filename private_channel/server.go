@@ -16,9 +16,7 @@ import (
 )
 
 const (
-	udpAddr             = ":8096"
-	maxHearbeatMiss     = 3
-	udpHearbeatInterval = 30 * time.Second
+	udpAddr = ":8096"
 )
 
 type udpClient struct {
@@ -62,8 +60,6 @@ func StartUDPServer() {
 	}
 	defer conn.Close()
 	log.Infof("UDP server listening on %s", udpAddr)
-
-	go sendUDPHeartbeats(conn)
 
 	for {
 		buffer := make([]byte, 1024)
@@ -139,29 +135,6 @@ func updateUDPClient(udpCon *net.UDPConn, clientAddr *net.UDPAddr) *udpClient {
 		log.Infof("New UDP client: %s\n", clientKey)
 	}
 	return udpClients[clientKey]
-}
-
-func sendUDPHeartbeats(conn *net.UDPConn) {
-	for {
-		time.Sleep(udpHearbeatInterval)
-		udpClientsLock.Lock()
-		for key, client := range udpClients {
-			if time.Since(client.lastHeartBeat) > 3*udpHearbeatInterval {
-				log.Infof("UDP client %s timed out, removing from list. \n", key)
-				delete(udpClients, key)
-				continue
-			}
-
-			heartbeatMsg := "UDP Heartbeat"
-			encryptHeartbeatMsg, _ := EncryptAES([]byte(heartbeatMsg))
-			_, err := conn.WriteToUDP([]byte(encryptHeartbeatMsg), client.addr)
-			if err != nil {
-				log.Infof("Failed to send UDP heartbeat to %s: %v\n", client.addr, err)
-				continue
-			}
-		}
-		udpClientsLock.Unlock()
-	}
 }
 
 func EncryptAES(plaintext []byte) ([]byte, error) {

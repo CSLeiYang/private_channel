@@ -23,6 +23,8 @@ const (
 	PrivatePackageOnePatchSize int           = 256
 	PrivatePackageLossBatchId                = ^uint32(0)
 	PrivateMessageLossRetryMax uint8         = 5
+	MaxHearbeatMiss                          = 3
+	UdpHearbeatInterval                      = 10 * time.Second
 )
 
 type PrivatePackage struct {
@@ -55,6 +57,7 @@ type PUdpConn struct {
 	conn          *net.UDPConn
 	remoteAddr    *net.UDPAddr
 	Done          chan struct{}
+	lastHeartBeat time.Time
 }
 
 type BizFun func(bool, string, []byte, *PUdpConn) error
@@ -148,11 +151,14 @@ func createTid() int64 {
 
 func NewPudpConn(conn *net.UDPConn, addr *net.UDPAddr, bizFn BizFun) *PUdpConn {
 	ph := &PUdpConn{
-		conn:       conn,
-		remoteAddr: addr,
+		conn:          conn,
+		remoteAddr:    addr,
+		lastHeartBeat: time.Now(),
+		Done:          make(chan struct{}),
 	}
 	go ph.HandleRecvPM(bizFn)
 	go ph.HandleSendPM()
+	go ph.sendUDPHeartbeats()
 	return ph
 }
 
@@ -269,6 +275,39 @@ func (pUdpConn *PUdpConn) HandleRecvPM(bizFn BizFun) {
 			})
 
 		}
+	}
+}
+func (pUdpConn *PUdpConn) sendUDPHeartbeats() {
+	for {
+		select {
+		case <-pUdpConn.Done:
+			log.Info("sendUDPHeartbeats quit!")
+		case <-time.After(UdpHearbeatInterval):
+			if time.Since(pUdpConn.lastHeartBeat) > MaxHearbeatMiss*UdpHearbeatInterval {
+				log.Infof("UDP client %v timed out, removing from list. \n", pUdpConn)
+				pUdpConn.UdpConnStop()
+			}
+
+			heartbeatMsg := "UDP Heartbeat"
+			encryptHeartbeatMsg, _ := EncryptAES([]byte(heartbeatMsg))
+			if pUdpConn.remoteAddr == nil {
+				_, err := pUdpConn.conn.Write(encryptHeartbeatMsg)
+				if err != nil {
+					log.Info(err)
+					continue
+				}
+
+			} else {
+				_, err := pUdpConn.conn.WriteToUDP(encryptHeartbeatMsg, pUdpConn.remoteAddr)
+				if err != nil {
+					log.Info(err)
+					continue
+				}
+			}
+			pUdpConn.lastHeartBeat = time.Now()
+
+		}
+
 	}
 }
 
