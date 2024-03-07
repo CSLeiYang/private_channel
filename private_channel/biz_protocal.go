@@ -27,7 +27,7 @@ type PEvent struct {
 	EventContent string `json:"event_content"`
 }
 
-func HandlePCommand(wholePM, bizInfo string, content []byte, pUdpConn *PUdpConn) error {
+func HandlePCommand(wholePM bool, bizInfo string, content []byte, pUdpConn *PUdpConn) error {
 	var (
 		pCmd   PCommand
 		pm     *PrivateMessage
@@ -46,6 +46,7 @@ func HandlePCommand(wholePM, bizInfo string, content []byte, pUdpConn *PUdpConn)
 			EventType:    pCmd.Cmd,
 			EventContent: string(content),
 		}
+		log.Info("pEvent: ", pEvent)
 	case "IMAGE", "AUDIO":
 		fileName := pCmd.Params
 		err := os.WriteFile(fileName, content, 0666)
@@ -79,6 +80,7 @@ func HandlePCommand(wholePM, bizInfo string, content []byte, pUdpConn *PUdpConn)
 }
 
 func HandlePEvent(wholePM bool, bizInfo string, content []byte, pUdpCon *PUdpConn) error {
+	log.Info("HandlePEvent")
 	if len(bizInfo) == 0 {
 		return errors.New("bizInfo is empty")
 	}
@@ -118,7 +120,7 @@ func HandlePEvent(wholePM bool, bizInfo string, content []byte, pUdpCon *PUdpCon
 		}()
 
 	case "CHAT":
-		log.Info("AI: ", string(content))
+		log.Info("AI: ", string(pEvent.EventContent))
 	}
 	return nil
 

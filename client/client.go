@@ -19,7 +19,7 @@ func main() {
 	}
 	reader := bufio.NewReader(os.Stdin)
 	log.Info("UDP Started")
-	serverAddress := "165.227.25.123:8096"
+	serverAddress := "127.0.0.1:8096"
 
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
@@ -34,7 +34,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	onePupConn := private_channel.NewPudpConn(conn, nil, private_channel.HandlePEvent)
+	onePupConn := private_channel.NewPudpConn(uint64(15314684225), conn, nil, private_channel.HandlePEvent)
 	go func() {
 		for {
 			buffer := make([]byte, 4096)
@@ -46,7 +46,12 @@ func main() {
 			dencryptedBytes, _ := private_channel.DescryptAES(buffer[:n])
 
 			if dencryptedBytes[0] == private_channel.PrivatePackageMagicNumber {
-				err := onePupConn.RecvPrivatePackage(dencryptedBytes)
+				pp, err := private_channel.DecodePrivatePackage(dencryptedBytes)
+				if err != nil {
+					log.Error(err)
+					continue
+				}
+				err = onePupConn.RecvPrivatePackage(pp)
 				if err != nil {
 					log.Error(err)
 					continue
@@ -142,7 +147,7 @@ func main() {
 				continue
 			}
 
-			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{BizInfo: string(bizInfo), Content: []byte(chatContent)})
+			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{Sid: 15314684225, BizInfo: string(bizInfo), Content: []byte(chatContent)})
 			if err != nil {
 				log.Warn(err)
 				continue
