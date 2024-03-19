@@ -3,10 +3,10 @@ package private_channel
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net"
 	log "private_channel/logger"
 	"sort"
@@ -17,41 +17,41 @@ import (
 )
 
 const (
-	PrivatePackageMagicNumber  uint8         = 0x88
-	PirvatePackageMinBytes     int           = 28
+	PirvatePackageMinBytes     int           = 10
 	PrivatePackageSaveTimeout  time.Duration = 800 * time.Millisecond
-	PrivatePackageMaxBytes     int           = 1024
-	PrivatePackageOnePatchSize int           = 256
-	PrivatePackageLossBatchId                = ^uint32(0)
+	PrivatePackageMaxBytes     int           = 1400
+	PrivatePackageOnePatchSize int           = 1024
+	PrivatePackageLossBatchId                = ^uint16(0)
 	PrivateMessageLossRetryMax uint8         = 5
-	MaxHearbeatMiss                          = 3
+	MaxHearbeatMiss                          = 30
 	UdpHearbeatInterval                      = 10 * time.Second
+	HeartbeatTid               uint64        = 0
 )
 
 type PrivatePackage struct {
-	MagicNumber     uint8
-	Sid             uint64
-	Tid             uint64
-	BatchId         uint32
-	BatchCount      uint32
-	Length          uint32
-	DataTotalLength uint32
-	Timestamp       int64
-	IsReliable      uint8
-	Content         []byte
+	//36:sid； 8:flag(0-可靠；1-流式【如果是流失，去掉解析BatchCount；否则需要解析BatchCount】； tid:20
+	Sid        uint64
+	Flag       uint64
+	Tid        uint64
+	BatchId    uint16
+	BatchCount uint16
+	Content    []byte
 }
 
 type PrivateMessage struct {
 	Sid                   uint64
 	Tid                   uint64
+	IsReliable            bool
+	LossRetry             uint8
+	IsStreaming           bool
 	BizInfo               string
 	LastTS                time.Time
 	ExpectCount           uint32
 	RealCount             uint32
-	ContentPackageBatches map[uint32]*PrivatePackage
+	NextBatchId           uint16
+	ContentPackageBatches map[uint16]*PrivatePackage
 	Content               []byte
 	Mu                    sync.RWMutex
-	IsReliable            uint8
 }
 
 type PUdpConn struct {
@@ -61,52 +61,36 @@ type PUdpConn struct {
 	conn          *net.UDPConn
 	remoteAddr    *net.UDPAddr
 	Done          chan struct{}
-	lastHeartBeat time.Time
 }
 
-type BizFun func(bool, string, []byte, *PUdpConn) error
+type BizFun func(uint64, bool, string, []byte, *PUdpConn) error
 
 func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 	var pkg PrivatePackage
 	if len(rawBytes) < PirvatePackageMinBytes {
+		log.Errorf("not valid PrivatePackage, length must be at least %d bytes", PirvatePackageMinBytes)
 		return nil, fmt.Errorf("not valid PrivatePackage, length must be at least %d bytes", PirvatePackageMinBytes)
 	}
 	buf := bytes.NewReader(rawBytes)
-	if err := binary.Read(buf, binary.BigEndian, &pkg.MagicNumber); err != nil {
+
+	var decodeSFT uint64
+	if err := binary.Read(buf, binary.BigEndian, &decodeSFT); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.Sid); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.Tid); err != nil {
-		return nil, err
-	}
+
+	pkg.Sid = (decodeSFT & (0xFFFFFFFFF0000000)) >> 28
+	pkg.Flag = (decodeSFT & (0x000000000FF00000)) >> 20
+	pkg.Tid = (decodeSFT & (0x00000000000FFFFF))
 	if err := binary.Read(buf, binary.BigEndian, &pkg.BatchId); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.BatchCount); err != nil {
-		return nil, err
+	if (pkg.Flag & 0b00000010) == 0 { //非流式
+		if err := binary.Read(buf, binary.BigEndian, &pkg.BatchCount); err != nil {
+			return nil, err
+		}
 	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.Length); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.DataTotalLength); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.Timestamp); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &pkg.IsReliable); err != nil {
-		return nil, err
-	}
-	if pkg.Length > uint32(len(rawBytes)) {
-		return nil, fmt.Errorf("pkg.Length %d is out of bound", pkg.Length)
-	}
-	if pkg.Length > uint32(PrivatePackageMaxBytes) {
-		return nil, fmt.Errorf("pkg.Length %d exceed the max bytes %d", pkg.Length, PrivatePackageMaxBytes)
-	}
-	pkg.Content = make([]byte, pkg.Length)
-	if err := binary.Read(buf, binary.BigEndian, &pkg.Content); err != nil {
+	pkg.Content = make([]byte, buf.Len())
+	if err := binary.Read(buf, binary.BigEndian, pkg.Content); err != nil {
 		return nil, err
 	}
 
@@ -116,32 +100,18 @@ func DecodePrivatePackage(rawBytes []byte) (*PrivatePackage, error) {
 func encodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
 	buf := new(bytes.Buffer)
 
-	if err := binary.Write(buf, binary.BigEndian, pkg.MagicNumber); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.Sid); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.Tid); err != nil {
+	var sft uint64 = (pkg.Sid << 28) | ((pkg.Flag) << 20) | (pkg.Tid)
+	if err := binary.Write(buf, binary.BigEndian, sft); err != nil {
 		return nil, err
 	}
 	if err := binary.Write(buf, binary.BigEndian, pkg.BatchId); err != nil {
 		return nil, err
 	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.BatchCount); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.Length); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.DataTotalLength); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.Timestamp); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, pkg.IsReliable); err != nil {
-		return nil, err
+	if (pkg.Flag & 0b00000010) == 0 { //非流式
+		if err := binary.Write(buf, binary.BigEndian, pkg.BatchCount); err != nil {
+			return nil, err
+		}
+	} else {
 	}
 	if err := binary.Write(buf, binary.BigEndian, pkg.Content); err != nil {
 		return nil, err
@@ -150,33 +120,25 @@ func encodePrivatePackage(pkg *PrivatePackage) ([]byte, error) {
 }
 
 func createTid() int64 {
-	now := time.Now()
-	const format = "20060102150405.999"
-	formattedTime := now.Format(format)
-	formattedTime = strings.ReplaceAll(formattedTime, ".", "")
-	tid, _ := strconv.ParseInt(formattedTime, 10, 64)
-	return tid
-
+	return int64(rand.Intn(math.MaxUint32 >> 12))
 }
 
 func NewPudpConn(oneSid uint64, conn *net.UDPConn, addr *net.UDPAddr, bizFn BizFun) *PUdpConn {
 	ph := &PUdpConn{
-		sid:           oneSid,
-		conn:          conn,
-		remoteAddr:    addr,
-		lastHeartBeat: time.Now(),
-		Done:          make(chan struct{}),
+		sid:        oneSid,
+		conn:       conn,
+		remoteAddr: addr,
+		Done:       make(chan struct{}),
 	}
 	go ph.HandleRecvPM(bizFn)
 	go ph.HandleSendPM()
-	go ph.sendUDPHeartbeats()
 	return ph
 }
 
 func findLossBatchIds(pm *PrivateMessage, start, end int) string {
 	var lossing string
 	for i := start; i <= end; i++ {
-		if _, exists := pm.ContentPackageBatches[uint32(i)]; !exists {
+		if _, exists := pm.ContentPackageBatches[uint16(i)]; !exists {
 			lossing += fmt.Sprintf("%d|", i)
 		}
 	}
@@ -187,12 +149,10 @@ func requestLossPackage(pUdpConn *PUdpConn, pm *PrivateMessage, batchLossIdsStr 
 	batchLossBytes := []byte(batchLossIdsStr)
 	lossPP := constructPrivatePackage(
 		pm.Sid,
+		0x00,
 		pm.Tid,
 		PrivatePackageLossBatchId,
 		1,
-		uint32(len(batchLossBytes)),
-		uint32(len(batchLossBytes)),
-		0,
 		batchLossBytes,
 	)
 	return SendPrivatePackage(pUdpConn, lossPP)
@@ -201,10 +161,12 @@ func requestLossPackage(pUdpConn *PUdpConn, pm *PrivateMessage, batchLossIdsStr 
 func handleLossPackage(pUdpConn *PUdpConn, pmId uint64, lossBatchIdsStr string) error {
 	actual, ok := pUdpConn.sendSyncPmMap.Load(pmId)
 	if !ok {
+		log.Errorf("not found pm:%v in sendSyncPmMap", pmId)
 		return fmt.Errorf("not found pm:%v in sendSyncPmMap", pmId)
 	}
 	pm, ok := actual.(*PrivateMessage)
 	if !ok {
+		log.Errorf("%v Store value is not of type *PrivateMessage", pmId)
 		return fmt.Errorf("%v Store value is not of type *PrivateMessage", pmId)
 	}
 
@@ -220,7 +182,7 @@ func handleLossPackage(pUdpConn *PUdpConn, pmId uint64, lossBatchIdsStr string) 
 			log.Error(err)
 			continue
 		}
-		onePP, ok := pm.ContentPackageBatches[uint32(batchId)]
+		onePP, ok := pm.ContentPackageBatches[uint16(batchId)]
 		if ok {
 			err := SendPrivatePackage(pUdpConn, onePP)
 			if err != nil {
@@ -244,39 +206,67 @@ func (pUdpConn *PUdpConn) HandleRecvPM(bizFn BizFun) {
 			pUdpConn.recvSyncPmMap.Range(func(key, value interface{}) bool {
 				pm, ok := value.(*PrivateMessage)
 				if ok {
-					if pm.RealCount == pm.ExpectCount {
-						pm.Mu.Lock()
-						wholePM, bizInfo, pmContent := resamplePPToPM(pm)
-						pUdpConn.recvSyncPmMap.Delete(key)
-						pm.Mu.Unlock()
-						go bizFn(wholePM, bizInfo, pmContent, pUdpConn)
+					if pm.IsStreaming { //流式处理
+						log.Info("streaming doing")
+						oneBatch, exists := pm.ContentPackageBatches[uint16(pm.NextBatchId)]
+						log.Infof("pm.NextBatchId: %v, exists: %v", pm.NextBatchId, exists)
+						if exists {
+							delete(pm.ContentPackageBatches, pm.NextBatchId)
+							go bizFn(pm.Sid, false, strconv.FormatUint(oneBatch.Tid, 10), oneBatch.Content, pUdpConn)
+							pm.NextBatchId++
+						} else {
+							err := requestLossPackage(pUdpConn, pm, strconv.FormatUint(uint64(pm.NextBatchId), 10))
+							if err != nil {
+								log.Error(err)
+							}
+							if time.Since(pm.LastTS) > PrivatePackageSaveTimeout {
+								log.Info("len(pm.ContentPackageBatches):", len(pm.ContentPackageBatches))
+								if len(pm.ContentPackageBatches) == 0 {
+									log.Warn("pm will be deleted: ", pm.Tid)
+									pm.ContentPackageBatches = nil
+									pUdpConn.recvSyncPmMap.Delete(key)
+								} else {
+									pm.NextBatchId++
+								}
+							}
+						}
 
-					} else {
-						if time.Since(pm.LastTS) > PrivatePackageSaveTimeout {
-							if pm.IsReliable == 0 || pm.IsReliable > PrivateMessageLossRetryMax {
-								log.Info("Deal not reliable")
-								pm.Mu.Lock()
-								wholePM, bizInfo, pmContent := resamplePPToPM(pm)
-								pm.Mu.Unlock()
-								pUdpConn.recvSyncPmMap.Delete(key)
-								go bizFn(wholePM, bizInfo, pmContent, pUdpConn)
+					} else { //非流式
+						if pm.RealCount == pm.ExpectCount {
+							pm.Mu.Lock()
+							wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+							pUdpConn.recvSyncPmMap.Delete(key)
+							pm.Mu.Unlock()
+							log.Info(bizInfo)
+							go bizFn(pm.Sid, wholePM, bizInfo, pmContent, pUdpConn)
 
-							} else {
-								log.Info("Deal reliable")
-								pm.IsReliable++ // flag have deal
-								pm.LastTS = time.Now()
-								if (pm.ExpectCount > 10 && pm.RealCount > uint32(float32(pm.ExpectCount)*0.7)) || (pm.ExpectCount <= 10) {
-									batchLossIdsStr := findLossBatchIds(pm, 1, int(pm.ExpectCount-1))
-									log.Info("batchLossIdStr: ", batchLossIdsStr)
-									err := requestLossPackage(pUdpConn, pm, batchLossIdsStr)
-									if err != nil {
-										log.Error(err)
+						} else {
+							if time.Since(pm.LastTS) > PrivatePackageSaveTimeout { //超时时间没有收到数据
+								if !pm.IsReliable || pm.LossRetry > PrivateMessageLossRetryMax { //不可靠传输，直接处理掉数据
+									log.Info("Deal not reliable")
+									pm.Mu.Lock()
+									wholePM, bizInfo, pmContent := resamplePPToPM(pm)
+									pm.Mu.Unlock()
+									pUdpConn.recvSyncPmMap.Delete(key)
+									go bizFn(pm.Sid, wholePM, bizInfo, pmContent, pUdpConn)
+
+								} else { //可靠传输
+									log.Info("Deal reliable")
+									pm.LastTS = time.Now().Add(PrivatePackageSaveTimeout * time.Duration(pm.LossRetry))
+									pm.LossRetry++
+									if (pm.ExpectCount > 10 && pm.RealCount > uint32(float32(pm.ExpectCount)*0.7)) || (pm.ExpectCount <= 10) {
+										batchLossIdsStr := findLossBatchIds(pm, 0, int(pm.ExpectCount-1))
+										log.Info("batchLossIdStr: ", batchLossIdsStr)
+										err := requestLossPackage(pUdpConn, pm, batchLossIdsStr)
+										if err != nil {
+											log.Error(err)
+										}
 									}
 
 								}
-
 							}
 						}
+
 					}
 
 				} else {
@@ -289,40 +279,6 @@ func (pUdpConn *PUdpConn) HandleRecvPM(bizFn BizFun) {
 		}
 	}
 }
-func (pUdpConn *PUdpConn) sendUDPHeartbeats() {
-	for {
-		select {
-		case <-pUdpConn.Done:
-			log.Info("sendUDPHeartbeats quit!")
-		case <-time.After(UdpHearbeatInterval):
-			if time.Since(pUdpConn.lastHeartBeat) > MaxHearbeatMiss*UdpHearbeatInterval {
-				log.Infof("UDP client %v timed out, removing from list. \n", pUdpConn)
-				pUdpConn.UdpConnStop()
-			}
-
-			heartbeatMsg := "UDP Heartbeat"
-			encryptHeartbeatMsg, _ := EncryptAES([]byte(heartbeatMsg))
-			if pUdpConn.remoteAddr == nil {
-				_, err := pUdpConn.conn.Write(encryptHeartbeatMsg)
-				if err != nil {
-					log.Info(err)
-					continue
-				}
-
-			} else {
-				_, err := pUdpConn.conn.WriteToUDP(encryptHeartbeatMsg, pUdpConn.remoteAddr)
-				if err != nil {
-					log.Info(err)
-					continue
-				}
-			}
-			pUdpConn.lastHeartBeat = time.Now()
-
-		}
-
-	}
-}
-
 func (pUdpConn *PUdpConn) HandleSendPM() {
 	for {
 		select {
@@ -354,19 +310,6 @@ func (pUdpConn *PUdpConn) UdpConnStop() {
 
 func (pUdpConn *PUdpConn) RecvPrivatePackage(pp *PrivatePackage) error {
 	start := time.Now()
-	actual, _ := pUdpConn.recvSyncPmMap.LoadOrStore(pp.Tid, &PrivateMessage{
-		Sid:                   pp.Sid,
-		Tid:                   pp.Tid,
-		LastTS:                time.Now(),
-		ExpectCount:           pp.BatchCount,
-		ContentPackageBatches: make(map[uint32]*PrivatePackage),
-		IsReliable:            pp.IsReliable,
-	})
-	pm, ok := actual.(*PrivateMessage)
-	if !ok {
-		return fmt.Errorf("%v Store value is not of type *PrivateMessage", pp.Tid)
-	}
-
 	if pp.BatchId == PrivatePackageLossBatchId {
 		//del loss batchid
 		log.Info("deal loss pp:", string(pp.Content))
@@ -376,17 +319,35 @@ func (pUdpConn *PUdpConn) RecvPrivatePackage(pp *PrivatePackage) error {
 		}
 
 	} else {
+		actual, _ := pUdpConn.recvSyncPmMap.LoadOrStore(pp.Tid, &PrivateMessage{
+			Sid:                   pp.Sid,
+			Tid:                   pp.Tid,
+			IsReliable:            (pp.Flag & 0b00000001) > 0,
+			IsStreaming:           (pp.Flag & 0b00000010) > 0,
+			LastTS:                time.Now(),
+			ContentPackageBatches: make(map[uint16]*PrivatePackage),
+		})
+
+		pm, ok := actual.(*PrivateMessage)
+		if !ok {
+			return fmt.Errorf("%v Store value is not of type *PrivateMessage", pp.Tid)
+		}
 		pm.Mu.Lock()
 		defer pm.Mu.Unlock()
 
-		pm.LastTS = time.Now()
-
-		if pp.BatchId == 0 {
-			pm.BizInfo = string(pp.Content)
+		if pm.IsStreaming {
+			pm.ContentPackageBatches[(pp.BatchId)] = pp
 		} else {
-			pm.ContentPackageBatches[pp.BatchId] = pp
+			pm.LastTS = time.Now()
+			pm.ExpectCount = uint32(pp.BatchCount)
+			if pp.BatchId == 0 {
+				pm.BizInfo = string(pp.Content)
+			} else {
+				pm.ContentPackageBatches[(pp.BatchId)] = pp
+			}
+			pm.RealCount++
+
 		}
-		pm.RealCount++
 
 		log.Infof("pp/pm/d: (%v:%v:%v)/(%v,%v,%v)/%v\n",
 			pp.Tid, pp.BatchId, pp.BatchCount,
@@ -409,11 +370,11 @@ func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 	pmContent := make([]byte, 0)
 	bizInfo := pm.BizInfo
 	for _, k := range keys {
-		pmContent = append(pmContent, pm.ContentPackageBatches[uint32(k)].Content...)
+		pmContent = append(pmContent, pm.ContentPackageBatches[uint16(k)].Content...)
 	}
 	wholePM := false
 	ppLoss := pm.ExpectCount - pm.RealCount
-	log.Infof("PM ExpectCount/RealCount %v/%v\n", pm.ExpectCount, pm.RealCount)
+	log.Infof("PM %v ExpectCount/RealCount %v/%v\n", pm.Tid, pm.ExpectCount, pm.RealCount)
 	if ppLoss == 0 {
 		wholePM = true
 	}
@@ -426,24 +387,20 @@ func resamplePPToPM(pm *PrivateMessage) (bool, string, []byte) {
 	return wholePM, bizInfo, pmContent
 
 }
-func constructPrivatePackage(sid uint64, tid uint64, batchId uint32, batchCount uint32, length uint32, dataTotalLength uint32, isReliable uint8, content []byte) *PrivatePackage {
+func constructPrivatePackage(sid uint64, flag uint64, tid uint64, batchId uint16, batchCount uint16, content []byte) *PrivatePackage {
 	return &PrivatePackage{
-		MagicNumber:     PrivatePackageMagicNumber,
-		Sid:             sid,
-		Tid:             tid,
-		BatchId:         batchId,
-		BatchCount:      batchCount,
-		Length:          length,
-		DataTotalLength: dataTotalLength,
-		Timestamp:       time.Now().Unix(),
-		IsReliable:      isReliable,
-		Content:         content,
+		Sid:        sid,
+		Tid:        tid,
+		Flag:       flag,
+		BatchId:    batchId,
+		BatchCount: batchCount,
+		Content:    content,
 	}
 
 }
 
 func SendPrivatePackage(pUdpConn *PUdpConn, pp *PrivatePackage) error {
-	log.Infof("pp.Tid/pp.BatchId:%v/%v/%v", pp.Tid, pp.BatchId, hex.EncodeToString(pp.Content))
+	log.Infof("remoteAddr:%v,pp.Tid/pp.BatchId:%v/%v/%v", pUdpConn.remoteAddr, pp.Tid, pp.BatchId, len(pp.Content))
 	encodePP, err := encodePrivatePackage(pp)
 	if err != nil {
 		return nil
@@ -469,22 +426,74 @@ func SendPrivatePackage(pUdpConn *PUdpConn, pp *PrivatePackage) error {
 
 }
 
+func (pUdpConn *PUdpConn) SendPrivateMessageStream(batchId uint16, pm *PrivateMessage) error {
+	if pm == nil {
+		log.Error("pm is nil when sending(stream)")
+		return errors.New("pm is nil when sending(stream)")
+	}
+	tid := pm.Tid
+	if tid == 0 {
+		log.Error("pm.Tid is 0 when sending(stream)")
+		return errors.New("pm.Tid is 0 when sending(stream)")
+	}
+
+	streamFlag := 0b00000010
+	if pm.IsReliable {
+		streamFlag = streamFlag | 0b00000001
+	}
+	streamPP := constructPrivatePackage(pm.Sid, uint64(streamFlag), uint64(tid), batchId, 0, []byte(pm.BizInfo))
+	err := SendPrivatePackage(pUdpConn, streamPP)
+	if err != nil {
+		return err
+	}
+
+	if pm.IsReliable {
+		//construct sendPM
+		actual, _ := pUdpConn.sendSyncPmMap.LoadOrStore(tid, &PrivateMessage{
+			Sid:                   pm.Sid,
+			Tid:                   tid,
+			ContentPackageBatches: make(map[uint16]*PrivatePackage),
+			LastTS:                time.Now(),
+			IsReliable:            pm.IsReliable,
+			IsStreaming:           pm.IsStreaming,
+		})
+
+		sendPm, ok := actual.(*PrivateMessage)
+		log.Info("sendPm: ", sendPm)
+		if !ok {
+			log.Errorf("%v Store value is not of type *PrivateMessage", pm.Tid)
+			return fmt.Errorf("%v Store value is not of type *PrivateMessage", pm.Tid)
+		}
+
+		sendPm.ContentPackageBatches[streamPP.BatchId] = streamPP
+	}
+	return nil
+
+}
+
 func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 	if pm == nil {
+		log.Error("pm is nil")
 		return errors.New("pm is nil")
+	}
+
+	tid := createTid()
+
+	sendFlag := 0b00000000
+	if pm.IsReliable {
+		sendFlag = sendFlag | 0b00000001
 	}
 
 	dataBytesLen := len(pm.Content)
 	batchCount := int(math.Ceil(float64(dataBytesLen) / float64(PrivatePackageOnePatchSize)))
-	tid := createTid()
-
-	firstPP := constructPrivatePackage(pm.Sid, uint64(tid), 0, uint32(batchCount+1), uint32(len(pm.BizInfo)), uint32(dataBytesLen), pm.IsReliable, []byte(pm.BizInfo))
+	log.Info("pm.BizInfo: ", pm.BizInfo)
+	firstPP := constructPrivatePackage(pm.Sid, uint64(sendFlag), uint64(tid), 0, uint16(batchCount+1), []byte(pm.BizInfo))
 
 	//construct sendPM
 	sendPm := &PrivateMessage{
 		Sid:                   firstPP.Sid,
 		Tid:                   firstPP.Tid,
-		ContentPackageBatches: make(map[uint32]*PrivatePackage),
+		ContentPackageBatches: make(map[uint16]*PrivatePackage),
 		LastTS:                time.Now(),
 		IsReliable:            pm.IsReliable,
 	}
@@ -505,12 +514,10 @@ func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 
 		dataPP := constructPrivatePackage(
 			pm.Sid,
+			uint64(sendFlag),
 			uint64(tid),
-			uint32(i+1),
-			uint32(batchCount+1),
-			uint32(end-start),
-			uint32(dataBytesLen),
-			pm.IsReliable,
+			uint16(i+1),
+			uint16(batchCount+1),
 			[]byte(pm.Content[start:end]),
 		)
 		sendPm.ContentPackageBatches[dataPP.BatchId] = dataPP
@@ -525,7 +532,7 @@ func (pUdpConn *PUdpConn) SendPrivateMessage(pm *PrivateMessage) error {
 
 	}
 
-	if sendPm.IsReliable > 0 {
+	if sendPm.IsReliable {
 		log.Infof("store pm sid:%v tid:%v to sendSyncPMMap", sendPm.Sid, sendPm.Tid)
 		pUdpConn.sendSyncPmMap.Store(sendPm.Tid, sendPm)
 

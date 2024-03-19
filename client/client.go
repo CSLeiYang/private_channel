@@ -8,12 +8,10 @@ import (
 	log "private_channel/logger"
 	private_channel "private_channel/private_channel"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 func main() {
-	sid := uuid.New().String()
+	sid := "15314684225"
 	if len(os.Args) > 1 {
 		sid = os.Args[1]
 	}
@@ -45,23 +43,15 @@ func main() {
 			}
 			dencryptedBytes, _ := private_channel.DescryptAES(buffer[:n])
 
-			if dencryptedBytes[0] == private_channel.PrivatePackageMagicNumber {
-				pp, err := private_channel.DecodePrivatePackage(dencryptedBytes)
-				if err != nil {
-					log.Error(err)
-					continue
-				}
-				err = onePupConn.RecvPrivatePackage(pp)
-				if err != nil {
-					log.Error(err)
-					continue
-				}
-
-			} else {
-				dencryptedBytesStr := string(dencryptedBytes)
-				if !strings.Contains(dencryptedBytesStr, "Heartbeat") {
-					log.Info("Recv: ", dencryptedBytesStr)
-				}
+			pp, err := private_channel.DecodePrivatePackage(dencryptedBytes)
+			if err != nil {
+				log.Error(err)
+				continue
+			}
+			err = onePupConn.RecvPrivatePackage(pp)
+			if err != nil {
+				log.Error(err)
+				continue
 			}
 
 		}
@@ -89,7 +79,7 @@ func main() {
 			pCmd := &private_channel.PCommand{
 				SID:    sid,
 				Cmd:    "ASR",
-				Params: "",
+				Params: "ASR.mp3",
 			}
 
 			bizInfo, err := json.Marshal(&pCmd)
@@ -147,7 +137,11 @@ func main() {
 				continue
 			}
 
-			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{Sid: 15314684225, BizInfo: string(bizInfo), Content: []byte(chatContent)})
+			err = onePupConn.SendPrivateMessage(&private_channel.PrivateMessage{
+				Sid:     15314684225,
+				BizInfo: string(bizInfo),
+				Content: []byte(chatContent),
+			})
 			if err != nil {
 				log.Warn(err)
 				continue

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	log "private_channel/logger"
+	"strconv"
 	"time"
 
 	"github.com/faiface/beep"
@@ -27,7 +28,9 @@ type PEvent struct {
 	EventContent string `json:"event_content"`
 }
 
-func HandlePCommand(wholePM bool, bizInfo string, content []byte, pUdpConn *PUdpConn) error {
+func HandlePCommand(userId uint64, wholePM bool, bizInfo string, content []byte, pUdpConn *PUdpConn) error {
+
+	log.Infof("HandlePCommand comming, bizInfo: %v", bizInfo)
 	var (
 		pCmd   PCommand
 		pm     *PrivateMessage
@@ -36,18 +39,28 @@ func HandlePCommand(wholePM bool, bizInfo string, content []byte, pUdpConn *PUdp
 
 	err := json.Unmarshal([]byte(bizInfo), &pCmd)
 	if err != nil {
+		log.Error(err.Error())
 		return err
 	}
 	log.Info("PCommand: ", pCmd)
 	switch pCmd.Cmd {
 	case "CHAT":
-		pEvent = PEvent{
-			SID:          pCmd.SID,
-			EventType:    pCmd.Cmd,
-			EventContent: string(content),
+		sid_uint64, _ := strconv.ParseUint(pCmd.SID, 10, 64)
+		tid := uint64(createTid())
+		streamPm := &PrivateMessage{
+			Sid:         sid_uint64,
+			Tid:         tid,
+			IsStreaming: true,
+			IsReliable:  true,
+			BizInfo:     (fmt.Sprintf("%s %d", content, 10)),
 		}
-		log.Info("pEvent: ", pEvent)
-	case "IMAGE", "AUDIO":
+		pUdpConn.SendPrivateMessageStream(uint16(3), streamPm)
+		pUdpConn.SendPrivateMessageStream(uint16(0), streamPm)
+		pUdpConn.SendPrivateMessageStream(uint16(5), streamPm)
+		pUdpConn.SendPrivateMessageStream(uint16(100), streamPm)
+
+		return nil
+	case "ASR":
 		fileName := pCmd.Params
 		err := os.WriteFile(fileName, content, 0666)
 		if err != nil {
@@ -58,6 +71,25 @@ func HandlePCommand(wholePM bool, bizInfo string, content []byte, pUdpConn *PUdp
 			EventType:    pCmd.Cmd,
 			EventContent: fmt.Sprintf("fileName: %s save success", fileName),
 		}
+	case "TTS":
+		ttsContent, _ := os.ReadFile("TTS.mp3")
+		pEvent = PEvent{
+			SID:          pCmd.SID,
+			EventType:    pCmd.Cmd,
+			EventContent: "TTS.mp3",
+		}
+		pEventStr, err := json.Marshal(&pEvent)
+		if err != nil {
+			return err
+		}
+
+		pm = &PrivateMessage{
+			BizInfo: string(pEventStr),
+			Content: ttsContent,
+		}
+		pUdpConn.SendPrivateMessage(pm)
+		return nil
+
 	default:
 		pEvent = PEvent{
 			SID:          pCmd.SID,
@@ -79,9 +111,10 @@ func HandlePCommand(wholePM bool, bizInfo string, content []byte, pUdpConn *PUdp
 
 }
 
-func HandlePEvent(wholePM bool, bizInfo string, content []byte, pUdpCon *PUdpConn) error {
-	log.Info("HandlePEvent")
+func HandlePEvent(userId uint64, wholePM bool, bizInfo string, content []byte, pUdpCon *PUdpConn) error {
+	log.Infof("HandlePEvent, bizInfo: %s, content:%v", bizInfo, len(content))
 	if len(bizInfo) == 0 {
+		log.Error("bizInfo is empty")
 		return errors.New("bizInfo is empty")
 	}
 

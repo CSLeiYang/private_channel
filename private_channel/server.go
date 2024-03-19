@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 const (
@@ -21,7 +20,7 @@ const (
 )
 
 type udpClient struct {
-	addr          *net.UDPAddr
+	remoteAddr    *net.UDPAddr
 	conn          *net.UDPConn
 	sid           string
 	lastHeartBeat time.Time
@@ -32,24 +31,6 @@ var (
 	udpClients     = make(map[string]*udpClient)
 	udpClientsLock sync.Mutex
 )
-
-func splitToBatches(s string, maxBytes int) [][]byte {
-	var batches [][]byte
-	var batch []byte
-	for len(s) > 0 {
-		_, size := utf8.DecodeRuneInString(s)
-		if len(batch)+size > maxBytes {
-			batches = append(batches, batch)
-			batch = []byte{}
-		}
-		batch = append(batch, s[:size]...)
-		s = s[size:]
-	}
-	if len(batch) > 0 {
-		batches = append(batches, batch)
-	}
-	return batches
-}
 
 func StartUDPServer() {
 	addr, err := net.ResolveUDPAddr("udp", udpAddr)
@@ -63,8 +44,11 @@ func StartUDPServer() {
 	defer conn.Close()
 	log.Infof("UDP server listening on %s", udpAddr)
 
+	//start hearbeats
+	go sendUDPHeartbeats()
+
 	for {
-		buffer := make([]byte, 1024)
+		buffer := make([]byte, 4096)
 		n, clientAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Warnf("Error reading UDP data: %s", err)
@@ -86,47 +70,24 @@ func StartUDPServer() {
 		copy(dataCopy, data)
 
 		go func(recvData []byte, oneClientAddr *net.UDPAddr) {
-			if recvData[0] == PrivatePackageMagicNumber {
-				log.Info("recvData: ", recvData)
-				//
-				pp, err := DecodePrivatePackage(recvData)
-				if err != nil {
-					log.Error(err)
-					return
-				}
-				//update addr or new client
-				oneUdpClient := updateUDPClient(pp.Sid, conn, oneClientAddr)
+			log.Infof("recvData:%v, remoteAddr: %v", recvData, oneClientAddr)
+			//
+			pp, err := DecodePrivatePackage(recvData)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+			//update addr or new client
+			oneUdpClient := updateUDPClient(pp.Sid, conn, oneClientAddr)
 
+			if pp.Tid == HeartbeatTid {
+
+				log.Infof("pp:%v is hearbeat,so ignore.", pp.Sid)
+			} else {
 				err = oneUdpClient.pudpConn.RecvPrivatePackage(pp)
 				if err != nil {
 					log.Warn(err)
 					return
-				}
-
-			} else {
-				recvMsg := string(data)
-				log.Infof("recvMsg: %v", recvMsg)
-				if strings.Contains(recvMsg, ">") {
-					parts := strings.Split(recvMsg, ">")
-					reqId := parts[0]
-					msg := parts[1]
-					returnMsg := ""
-					log.Info(reqId, msg)
-					// returnMsg, err := service.CreateChatDialogReturn(reqId, msg)
-					// if err != nil {
-					// 	log.Warnf("CreateChatDialogReturn err: %s", err)
-					// 	return
-					// }
-					log.Infof("Send %s to %s", returnMsg, clientAddr)
-
-					batches := splitToBatches(returnMsg, 1024)
-					for _, batch := range batches {
-						encryptReturnMsg, _ := EncryptAES([]byte(batch))
-						n, err = conn.WriteToUDP([]byte(encryptReturnMsg), clientAddr)
-						if err != nil {
-							log.Warnf("WriteToUdp error: %s", err)
-						}
-					}
 				}
 			}
 
@@ -136,7 +97,6 @@ func StartUDPServer() {
 }
 
 func updateUDPClient(sid uint64, udpCon *net.UDPConn, clientAddr *net.UDPAddr) *udpClient {
-	log.Info(sid)
 	clientKey := strconv.FormatUint(sid, 10)
 	udpClientsLock.Lock()
 	defer udpClientsLock.Unlock()
@@ -145,14 +105,47 @@ func updateUDPClient(sid uint64, udpCon *net.UDPConn, clientAddr *net.UDPAddr) *
 		oldAddr := client.pudpConn.remoteAddr
 		if !(oldAddr.IP.Equal(clientAddr.IP) && oldAddr.Port == clientAddr.Port) {
 			log.Infof("client: %s addr changed, from %s to %s", clientKey, oldAddr, clientAddr)
-			client.addr = clientAddr
+			client.remoteAddr = clientAddr
 			client.pudpConn.remoteAddr = clientAddr
 		}
 	} else {
-		udpClients[clientKey] = &udpClient{sid: clientKey, conn: udpCon, addr: clientAddr, lastHeartBeat: time.Now(), pudpConn: NewPudpConn(sid, udpCon, clientAddr, HandlePCommand)}
+		udpClients[clientKey] = &udpClient{sid: clientKey, conn: udpCon, remoteAddr: clientAddr, lastHeartBeat: time.Now(), pudpConn: NewPudpConn(sid, udpCon, clientAddr, HandlePCommand)}
 		log.Infof("New UDP client: %s\n", clientKey)
 	}
 	return udpClients[clientKey]
+}
+
+func sendUDPHeartbeats() error {
+	for {
+		time.Sleep(UdpHearbeatInterval)
+		udpClientsLock.Lock()
+		for clientKey, oneUdpClient := range udpClients {
+			if time.Since(oneUdpClient.lastHeartBeat) > MaxHearbeatMiss*UdpHearbeatInterval {
+				log.Infof("UDP client %v timed out, removing from list. \n", clientKey)
+				oneUdpClient.pudpConn.UdpConnStop()
+				delete(udpClients, clientKey)
+			}
+
+			//send heartbeat
+			heartbeatMsg := []byte("UDP Heartbeat")
+			uint64_sid, _ := strconv.ParseUint(clientKey, 10, 64)
+			heartbeatPP := constructPrivatePackage(
+				uint64_sid,
+				0x00,
+				HeartbeatTid,
+				0,
+				1,
+				heartbeatMsg,
+			)
+
+			err := SendPrivatePackage(oneUdpClient.pudpConn, heartbeatPP)
+			if err != nil {
+				udpClientsLock.Unlock()
+				continue
+			}
+		}
+		udpClientsLock.Unlock()
+	}
 }
 
 func EncryptAES(plaintext []byte) ([]byte, error) {
